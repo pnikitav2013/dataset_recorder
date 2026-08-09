@@ -1,0 +1,5 @@
+# channel_extractor uses only the Python standard library (pathlib, shutil,
+# argparse), so it has no third-party dependencies. Run it with the shared
+# py_recorder virtualenv (../.venv) or any Python 3.10+ interpreter:
+#
+#     python -m channel_extractor <source> <prefix> <dest>

@@ -1,0 +1,7 @@
+pyserial>=3.5,<4
+numpy>=1.24
+librosa>=0.10
+matplotlib>=3.7
+scipy>=1.10
+soundfile>=0.12
+sounddevice>=0.4

@@ -1,0 +1,54 @@
+{
+  "folder": "/home/nikita/Project/workspace/stm32n6_base/py_recorder/dev_other_wav",
+  "output_device": "pipewire",
+  "output_routing": "both",
+  "window_width": 2823,
+  "window_height": 1158,
+  "schedule": {
+    "enabled": false,
+    "start": "08:00",
+    "end": "22:00"
+  },
+  "slots": [
+    {
+      "type": "board",
+      "prefix": "mic1_stm32",
+      "serial_port": "",
+      "baud": 921600,
+      "input_device": "USB Device 0x46d:0x81b: Audio (hw:1,0)",
+      "channel": -1
+    },
+    {
+      "type": "mic",
+      "prefix": "X3800",
+      "serial_port": "",
+      "baud": 921600,
+      "input_device": "USB Device 0x46d:0x81b: Audio (hw:1,0)",
+      "channel": 0
+    },
+    {
+      "type": "mic",
+      "prefix": "fifine",
+      "serial_port": "",
+      "baud": 921600,
+      "input_device": "USB Device 0x46d:0x81b: Audio (hw:1,0)",
+      "channel": 1
+    },
+    {
+      "type": "off",
+      "prefix": "mic4",
+      "serial_port": "",
+      "baud": 921600,
+      "input_device": "USB Device 0x46d:0x81b: Audio (hw:1,0)",
+      "channel": -1
+    },
+    {
+      "type": "off",
+      "prefix": "mic5",
+      "serial_port": "",
+      "baud": 921600,
+      "input_device": "USB Device 0x46d:0x81b: Audio (hw:1,0)",
+      "channel": -1
+    }
+  ]
+}

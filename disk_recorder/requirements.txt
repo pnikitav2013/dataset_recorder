@@ -1,0 +1,11 @@
+# Runtime dependencies for the disk_recorder GUI tool.
+# Install with:  python -m pip install -r disk_recorder/requirements.txt
+# (Tkinter ships with CPython; on Linux install the system "python3-tk" package.)
+
+pyserial>=3.5,<4      # STM32 board capture over UART (serial_link / sources)
+numpy>=1.24          # PCM buffers, mixing, alignment math
+scipy>=1.10          # resample_poly for playback rate matching / sync
+librosa>=0.10        # log-mel spectrograms (mel.py)
+matplotlib>=3.7      # stacked spectrogram figures embedded in the Tk window
+soundfile>=0.12      # reading/writing WAV/FLAC/OGG reference + output files
+sounddevice>=0.4     # PortAudio playback and PC-microphone capture
