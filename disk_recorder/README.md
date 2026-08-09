@@ -53,16 +53,54 @@ python -m disk_recorder          # opens the window (run from py_recorder/)
 On Windows 10: from an activated venv, `python -m disk_recorder` in `py_recorder\`.
 `tkinter` ships with the python.org installer; `sounddevice` bundles PortAudio.
 
+## Multi-day runs
+
+The app is built to be left running for days, which puts the *host audio stack*
+— not the pipeline — on the critical path. Three rules follow from that.
+
+**The output device is opened once.** `Player` holds a single `OutputStream` for
+the whole session and resamples every file to its fixed rate. Opening and
+closing the device per file (what `sd.play()` does) means tens of thousands of
+open/close/format-renegotiation cycles through the Windows audio engine, which
+leaks handles until system audio breaks and only a reboot fixes it.
+
+**Nothing waits forever.** Device reads have no timeout of their own, so every
+capture has a wall-clock budget; overrunning it makes the pipeline ask the
+capture to stop, escalate to `Pa_AbortStream` if it does not, re-open the
+device, and — if the device is wedged inside its driver — stop the run with the
+reason in the status line instead of hanging with the GUI still showing
+"recording".
+
+**Everything is logged.** Progress plus process RSS / handle count / thread
+count are written every 60 s to `disk_recorder.log` (rotating, in the launch
+directory). A climbing handle count shows up there hours before it becomes an
+outage.
+
+### Windows 10 host settings
+
+Worth doing once on the machine that runs the sessions:
+
+* pick the **WASAPI** entry for the speaker and the microphones (the app
+  prefers it automatically and warns if a WDM-KS device is selected);
+* Sound → device properties → *Advanced*: uncheck **"Allow applications to take
+  exclusive control"**, and set the same default format (e.g. 48000 Hz, 16 bit)
+  for the input and the output;
+* device properties → *Enhancements*: **disable all sound effects**;
+* Power options: disable **USB selective suspend**, and untick *"Allow the
+  computer to turn off this device to save power"* on the USB hubs and audio
+  devices. The app already inhibits sleep and display timeout while running.
+
 ## Modules
 
 | Module        | Responsibility |
 |---------------|----------------|
 | `config`      | tunable `Settings` (baud, sample rate, headroom, retries, margins, `_R_` marker) |
 | `appconfig`   | JSON-persisted GUI config (folder, output device, three input-device slots) |
-| `devices`     | enumerate serial ports + audio output/input devices |
+| `devices`     | enumerate serial ports + audio devices, rank host APIs (WASAPI ≫ MME ≫ WDM-KS) |
 | `serial_link` | open the port + background reader thread |
-| `sources`     | `BoardSource` (STM32 UART) / `MicSource` (PC mic) capture + error counting |
-| `playback`    | load file, non-blocking play, 16 kHz mono reference |
+| `sources`     | `BoardSource` (STM32 UART) / `MicSource` (PC mic) capture, capture deadlines + cooperative abort |
+| `playback`    | load file, **one persistent output stream**, 16 kHz mono reference |
+| `diag`        | process RSS/handle sampling for the heartbeat, Windows sleep inhibition |
 | `sync`        | cross-correlation alignment + trim |
 | `mel`         | log-mel spectrogram `Figure`s, incl. stacked per-device (object API, thread-safe) |
 | `storage`     | recursive scan (excludes `*_R_*`), WAV write, original deletion |

@@ -26,7 +26,10 @@ class AlignResult:
 
 
 def _normalise(x: np.ndarray) -> np.ndarray:
-    x = x.astype(np.float64)
+    # float32 halves the FFT work of the correlation (the dominant cost per
+    # file) at no meaningful accuracy loss: the result is a lag index and a
+    # confidence compared against a 0.10 threshold.
+    x = x.astype(np.float32)
     x = x - x.mean()
     norm = np.linalg.norm(x)
     return x / norm if norm > 0 else x
@@ -43,8 +46,8 @@ def align(captured: np.ndarray, reference: np.ndarray, sample_rate: int,
     """
     from scipy.signal import correlate
 
-    cap = captured.astype(np.float64)
-    ref = reference.astype(np.float64)
+    cap = captured.astype(np.float32)
+    ref = reference.astype(np.float32)
     if cap.size == 0 or ref.size == 0:
         return AlignResult(pcm=captured[:0].astype(np.int16), lag_samples=0,
                            correlation=0.0, underrun=True)
@@ -63,7 +66,7 @@ def align(captured: np.ndarray, reference: np.ndarray, sample_rate: int,
     # Confidence: correlation between the reference and the aligned segment.
     compare_len = min(ref.size, segment.size)
     if compare_len > 1:
-        a = _normalise(segment[:compare_len].astype(np.float64))
+        a = _normalise(segment[:compare_len].astype(np.float32))
         b = ref_n[:compare_len]
         score = float(abs(np.dot(a, b)))
     else:

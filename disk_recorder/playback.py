@@ -8,6 +8,7 @@ to align the capture.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -64,17 +65,189 @@ def reference_16k(reference: Reference, target_rate: int = 16000) -> np.ndarray:
 
 
 class Player:
-    """Non-blocking playback on a selected output device (``sounddevice``).
+    """Playback on a **single, persistently open** output stream.
 
-    Raw ALSA ``hw:`` outputs (e.g. HDMI) only accept their native rates, so if
-    the file's rate is rejected the audio is resampled to a rate the device
-    supports and playback is retried. Alignment is unaffected — it always uses
-    the 16 kHz reference, independent of the playback rate.
+    The device is opened once per run (:meth:`open`) and stays open until
+    :meth:`close`; each file is resampled to the stream's fixed rate and handed
+    to the PortAudio callback, and :meth:`stop` merely silences the stream
+    instead of tearing it down.
+
+    This matters far more than it looks. The previous implementation used
+    ``sd.play()`` / ``sd.stop()``, which open and close the device — and
+    renegotiate its sample-rate — for **every single file**. Over a multi-day
+    run that is tens of thousands of open/close cycles through the Windows
+    audio engine (``audiodg.exe``), which leaks handles and eventually wedges
+    system-wide audio until the machine is rebooted. One stream for the whole
+    session removes the churn entirely, and as a bonus removes the per-file
+    device-open latency that used to eat into the alignment guard window.
     """
+
+    #: Rates tried when the device advertises nothing usable, best first.
+    _FALLBACK_RATES = (48000, 44100, 32000, 16000)
 
     def __init__(self, output_device: int | None, routing: str = "both") -> None:
         self._device = output_device
         self._routing = routing
+        self._stream = None
+        self._rate: int | None = None
+        self._channels: int | None = None
+        self._open_lock = threading.Lock()
+        self._done = threading.Event()
+        self._done.set()
+        # Published to the callback; assignment order is (None → pos → data) so
+        # the callback never sees a new buffer with a stale read position.
+        self._data: np.ndarray | None = None
+        self._pos = 0
+        #: Set when the configured device could not be opened and playback fell
+        #: back to the system default — the run is then recording through an
+        #: unknown speaker and the pipeline surfaces this as a hard error.
+        self.fallback_device: int | None = None
+
+    # ----- device probing -----
+
+    def _device_info(self, device: int | None) -> dict:
+        import sounddevice as sd
+
+        try:
+            return dict(sd.query_devices(device, "output"))
+        except Exception:  # pragma: no cover - hardware dependent
+            return {}
+
+    def _device_rates(self, info: dict) -> list[int]:
+        """Device-native rate first, then common rates as fallbacks."""
+        rates: list[int] = []
+        default_rate = int(round(info.get("default_samplerate", 0)))
+        if default_rate:
+            rates.append(default_rate)
+        for rate in self._FALLBACK_RATES:
+            if rate not in rates:
+                rates.append(rate)
+        return rates
+
+    def _default_output(self) -> int | None:
+        """System default output device index (shared mode, coexists with others)."""
+        import sounddevice as sd
+
+        try:
+            default = sd.default.device
+            out = default[1] if isinstance(default, (list, tuple)) else default
+            return int(out) if out is not None and out >= 0 else None
+        except Exception:  # pragma: no cover - hardware dependent
+            return None
+
+    # ----- stream lifecycle -----
+
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        """Feed the queued file into the device; silence when nothing is queued.
+
+        Runs on the PortAudio thread, so it only ever touches ``_data`` /
+        ``_pos`` and must not allocate or block.
+        """
+        data = self._data
+        if data is None:
+            outdata[:] = 0
+            return
+        start = self._pos
+        end = min(start + frames, len(data))
+        count = end - start
+        outdata[:count] = data[start:end]
+        if count < frames:
+            outdata[count:] = 0
+            self._data = None
+            self._pos = 0
+            self._done.set()
+        else:
+            self._pos = end
+
+    def _open_on(self, device: int | None) -> bool:
+        """Open and start the persistent stream on ``device``; True on success."""
+        import sounddevice as sd
+
+        info = self._device_info(device)
+        channels = 2 if int(info.get("max_output_channels", 2) or 2) >= 2 else 1
+        for rate in self._device_rates(info):
+            try:
+                stream = sd.OutputStream(
+                    samplerate=rate, channels=channels, dtype="float32",
+                    device=device, latency="high", callback=self._callback)
+                stream.start()
+            except sd.PortAudioError as exc:
+                logger.debug("device %s rejected %u Hz/%uch (%s)",
+                             device, rate, channels, exc)
+                continue
+            self._stream, self._rate, self._channels = stream, rate, channels
+            logger.info("output stream open on device %s (%s) at %u Hz/%uch — "
+                        "kept open for the whole session",
+                        device, info.get("name", "?"), rate, channels)
+            if channels < 2 and self._routing != "both":
+                logger.warning("device %s is mono — output routing '%s' ignored",
+                               device, self._routing)
+            return True
+        return False
+
+    def open(self) -> None:
+        """Open the output device once for the whole run.
+
+        Falls back to the system default output if the configured device cannot
+        be opened at all (an exclusive host API held by another process), and
+        records that in :attr:`fallback_device` so the caller can treat the run
+        as compromised rather than silently recording through another speaker.
+        """
+        with self._open_lock:
+            if self._stream is not None:
+                return
+            if self._open_on(self._device):
+                return
+            fallback = self._default_output()
+            if fallback is not None and fallback != self._device:
+                logger.error("output device %s cannot be opened — falling back "
+                             "to the system default output %s",
+                             self._device, fallback)
+                if self._open_on(fallback):
+                    self.fallback_device = fallback
+                    return
+            info = self._device_info(self._device)
+            raise RuntimeError(
+                f"output device {self._device} ({info.get('name', '?')}) accepts "
+                f"no sample rate; the system default output also failed — pick a "
+                f"non-exclusive host API (WASAPI/DirectSound/MME) for this speaker")
+
+    def is_alive(self) -> bool:
+        """True while the persistent stream is open and running."""
+        stream = self._stream
+        if stream is None:
+            return False
+        try:
+            return not stream.closed and stream.active
+        except Exception:  # pragma: no cover - hardware dependent
+            return False
+
+    # ----- playback -----
+
+    def play(self, reference: Reference) -> None:
+        """Queue ``reference`` on the open stream; returns immediately.
+
+        The file is downmixed/routed and resampled to the stream's fixed rate,
+        so playback never touches the device configuration.
+        """
+        if self._stream is None:
+            self.open()
+        if not self.is_alive():
+            # The device died under us (unplugged, driver reset). Rebuild the
+            # stream once rather than silently playing into a dead handle.
+            logger.error("output stream is no longer active — reopening")
+            self._teardown()
+            self.open()
+
+        payload = self._route(reference.samples) if self._channels == 2 \
+            else to_mono(reference.samples).reshape(-1, 1)
+        payload = _resample(payload, reference.sample_rate, self._rate)
+        np.clip(payload, -1.0, 1.0, out=payload)
+
+        self._data = None                     # stop the callback reading …
+        self._pos = 0                         # … while the position is reset
+        self._done.clear()
+        self._data = np.ascontiguousarray(payload, dtype=np.float32)
 
     def _route(self, samples: np.ndarray) -> np.ndarray:
         """Downmix to mono, then map onto a stereo frame per the routing mode.
@@ -90,113 +263,29 @@ class Player:
             return np.column_stack([silence, mono])
         return np.column_stack([mono, mono])
 
-    def _device_info(self, device: int | None) -> dict:
-        import sounddevice as sd
-
-        try:
-            return dict(sd.query_devices(device, "output"))
-        except Exception:  # pragma: no cover - hardware dependent
-            return {}
-
-    def _device_rates(self, info: dict) -> list[int]:
-        rates: list[int] = []
-        default_rate = int(round(info.get("default_samplerate", 0)))
-        if default_rate:
-            rates.append(default_rate)
-        for rate in (48000, 44100, 32000, 16000):
-            if rate not in rates:
-                rates.append(rate)
-        return rates
-
-    def _default_output(self) -> int | None:
-        """System default output device index (shared-mode, coexists with others)."""
-        import sounddevice as sd
-
-        try:
-            default = sd.default.device
-            out = default[1] if isinstance(default, (list, tuple)) else default
-            return int(out) if out is not None and out >= 0 else None
-        except Exception:  # pragma: no cover - hardware dependent
-            return None
-
-    def _candidate_devices(self) -> list[int | None]:
-        """The chosen device first, then the system default as a fallback.
-
-        The configured device may use an exclusive host API (e.g. Windows
-        WDM-KS) that stops opening once another process grabs the speaker; the
-        shared-mode default output keeps unattended runs alive.
-        """
-        candidates: list[int | None] = [self._device]
-        fallback = self._default_output()
-        if fallback is not None and fallback != self._device:
-            candidates.append(fallback)
-        return candidates
-
-    def _play_on(self, device: int | None, reference: Reference) -> bool:
-        """Try every ``(rate, channels)`` combo on one device; True if playing."""
-        import sounddevice as sd
-
-        info = self._device_info(device)
-        max_out = int(info.get("max_output_channels", 2) or 2)
-
-        # Preferred layout is the routed stereo frame; fall back to mono for
-        # devices that only expose a single output channel.
-        layouts: list[tuple[int, np.ndarray]] = []
-        if max_out >= 2:
-            layouts.append((2, self._route(reference.samples)))
-        layouts.append((1, to_mono(reference.samples)))
-
-        # Try the file's own rate first, then the device's supported rates.
-        src_rate = reference.sample_rate
-        rates = [src_rate] + [r for r in self._device_rates(info) if r != src_rate]
-
-        for rate in rates:
-            for channels, data in layouts:
-                try:
-                    sd.check_output_settings(
-                        device=device, samplerate=rate, channels=channels)
-                except Exception:
-                    continue
-                try:
-                    payload = _resample(data, src_rate, rate)
-                    sd.play(payload, rate, device=device)
-                except sd.PortAudioError as exc:
-                    # -9999 host errors (exclusive WDM-KS busy) land here too.
-                    logger.warning("device %s rejected %u Hz/%uch (%s)",
-                                   device, rate, channels, exc)
-                    continue
-                if device != self._device or rate != src_rate or channels < 2:
-                    logger.info("playing %s on device %s at %u Hz/%uch (source %u Hz)",
-                                reference.path, device, rate, channels, src_rate)
-                return True
-        return False
-
-    def play(self, reference: Reference) -> None:
-        """Begin playback; returns immediately.
-
-        Probes ``(channels, rate)`` combinations each candidate device actually
-        supports (via ``check_output_settings`` + a real open) and resamples /
-        downmixes to the first that works. If the configured device cannot open
-        — e.g. an exclusive Windows WDM-KS speaker seized by another process —
-        playback falls back to the system default output device.
-        """
-        for device in self._candidate_devices():
-            if self._play_on(device, reference):
-                return
-
-        info = self._device_info(self._device)
-        name = info.get("name", self._device)
-        raise RuntimeError(
-            f"output device {self._device} ({name}) accepts no sample rate; "
-            f"the system default output also failed — pick a non-exclusive "
-            f"host API (MME/WASAPI/DirectSound) for this speaker")
-
-    def wait(self) -> None:  # pragma: no cover - hardware dependent
-        import sounddevice as sd
-
-        sd.wait()
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until the queued file has played out (or ``timeout`` elapses)."""
+        return self._done.wait(timeout)
 
     def stop(self) -> None:
-        import sounddevice as sd
+        """Silence playback **without** closing the device."""
+        self._data = None
+        self._pos = 0
+        self._done.set()
 
-        sd.stop()
+    def _teardown(self) -> None:
+        stream, self._stream = self._stream, None
+        self._rate = self._channels = None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:  # pragma: no cover - hardware dependent
+                pass
+
+    def close(self) -> None:
+        """Close the output device — called once, when the run ends."""
+        with self._open_lock:
+            self.stop()
+            self._teardown()
+        logger.info("output stream closed")

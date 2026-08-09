@@ -15,10 +15,11 @@ Each module owns one concern:
 * :mod:`disk_recorder.sources`     — capture from the board (or a PC microphone)
 * :mod:`disk_recorder.playback`    — load and play reference audio
 * :mod:`disk_recorder.sync`        — cross-correlation alignment
-* :mod:`disk_recorder.mel`         — log-mel spectrogram figure
+* :mod:`disk_recorder.mel`         — log-mel spectrogram data and drawing
 * :mod:`disk_recorder.storage`     — folder scan / WAV writing / deletion
 * :mod:`disk_recorder.pipeline`    — orchestration with retries
 * :mod:`disk_recorder.state`       — thread-safe session state
+* :mod:`disk_recorder.diag`        — process resource sampling / sleep inhibition
 * :mod:`disk_recorder.gui`         — Tkinter window
 """
 

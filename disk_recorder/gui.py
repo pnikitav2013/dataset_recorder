@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from . import devices
+from . import devices, diag, mel
 from .appconfig import (OUTPUT_ROUTES, SLOT_COUNT, SLOT_TYPES, TYPE_BOARD,
                         TYPE_MIC, TYPE_OFF, AppConfig, Schedule, SlotConfig)
 from .config import Settings
@@ -259,6 +259,7 @@ class App:
         self._channel_labels: tuple[str, ...] = ()
         self._fig_token = 0
         self._canvas = None
+        self._figure = None   # one long-lived Figure, redrawn in place
 
         root.title("disk_recorder — STM32 multi-mic re-recorder")
         root.geometry(f"{self._config.window_width}x{self._config.window_height}")
@@ -428,6 +429,13 @@ class App:
 
     def _on_close(self) -> None:
         self._save_config()
+        # Give the pipeline a moment to close the serial ports and the audio
+        # streams itself; killing the interpreter with streams still open is
+        # exactly the kind of thing that leaves the audio stack in a bad state.
+        if self._pipeline.is_running():
+            logger.info("window closing — stopping the run")
+            self._pipeline.stop()
+            self._pipeline.join(timeout=10.0)
         self._root.destroy()
 
     def _on_slot_type_change(self) -> None:  # placeholder hook for live updates
@@ -463,15 +471,13 @@ class App:
             self._output_combo.current(self._preferred_output_index())
 
     def _preferred_output_index(self) -> int:
-        """Prefer the system mixer (pulse/pipewire/default) which resamples
-        freely, over raw ALSA ``hw:`` / HDMI outputs that reject odd rates."""
-        for keyword in ("pipewire", "pulse", "default"):
-            for i, dev in enumerate(self._output_devices):
-                if keyword in dev.name.lower():
-                    return i
-        default_out = devices.default_output_index()
-        return next((i for i, d in enumerate(self._output_devices)
-                     if d.index == default_out), 0)
+        """Pick the most robust host API for the default output device.
+
+        On Windows that means WASAPI over DirectSound over MME, and never
+        WDM-KS; on Linux it means the sound server over a raw ALSA ``hw:``
+        device. See :func:`devices.preferred_index`.
+        """
+        return devices.preferred_index(self._output_devices, want_output=True)
 
     def _browse(self) -> None:
         folder = filedialog.askdirectory(title="Choose audio folder")
@@ -511,15 +517,43 @@ class App:
                 "disk_recorder",
                 "Working hours need two distinct HH:MM times (e.g. 08:00 and 22:00).")
             return
+        output = self._output_devices[self._output_combo.current()]
+        if not self._confirm_host_apis(output, specs):
+            return
         channels = self._assemble_channels(specs)
 
         self._save_config()
-        output_index = self._output_devices[self._output_combo.current()].index
         routing = DISPLAY_ROUTE.get(self._routing_var.get(), "both")
-        player = Player(output_index, routing)
+        player = Player(output.index, routing)
         self._pipeline.start(folder, channels, player, schedule)
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
+
+    def _confirm_host_apis(self, output: devices.AudioDeviceInfo,
+                           specs: list[_SlotSpec]) -> bool:
+        """Warn before starting a long run on a fragile host API.
+
+        WDM-KS opens the device exclusively and is the least tolerant of long
+        unattended sessions; a run left on it for days is the configuration
+        most likely to end with system audio needing a reboot.
+        """
+        risky = [output.label] if devices.is_discouraged(output) else []
+        by_index = {d.index: d for d in self._input_devices}
+        for spec in specs:
+            device = by_index.get(spec.device_index) if spec.kind == TYPE_MIC else None
+            if device is not None and devices.is_discouraged(device):
+                risky.append(device.label)
+        if not risky:
+            return True
+        logger.warning("selected device(s) on a discouraged host API: %s",
+                       ", ".join(risky))
+        return messagebox.askokcancel(
+            "disk_recorder",
+            "These devices use the WDM-KS host API:\n\n  "
+            + "\n  ".join(risky)
+            + "\n\nWDM-KS takes exclusive control of the hardware and is the "
+              "least stable choice for a multi-day run. Prefer the WASAPI entry "
+              "for the same device.\n\nStart anyway?")
 
     def _assemble_channels(self, specs: list[_SlotSpec]) -> list[Channel]:
         """Build capture channels, sharing one MicSource per physical device so
@@ -604,25 +638,68 @@ class App:
         label.configure(text=text, bg=bg, fg=fg)
 
     def _refresh_figure(self) -> None:
-        token, figure = self._state.figure_for(self._fig_token)
-        if figure is None:
-            return
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        """Redraw the spectrograms into the *same* Figure and Tk canvas.
 
-        if self._canvas is not None:
-            self._canvas.get_tk_widget().destroy()
-        self._canvas = FigureCanvasTkAgg(figure, master=self._canvas_frame)
-        self._canvas.draw()
-        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        The previous implementation built a Figure per file and replaced the
+        whole ``FigureCanvasTkAgg`` (and its Tk photo image) on every update.
+        Across a multi-day run that is tens of thousands of matplotlib object
+        graphs and Tk images churned through the interpreter; reusing one
+        Figure keeps memory flat instead.
+        """
+        token, panels = self._state.panels_for(self._fig_token)
+        if panels is None:
+            return
+        if self._figure is None:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+
+            self._figure = Figure(figsize=(7, 3.2), dpi=100)
+            self._canvas = FigureCanvasTkAgg(self._figure, master=self._canvas_frame)
+            self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        mel.render_panels(self._figure, panels)
+        self._canvas.draw_idle()
         self._fig_token = token
+
+
+#: Rotating log kept next to the config, in the launch directory.
+LOG_FILENAME = "disk_recorder.log"
+_LOG_MAX_BYTES = 20 * 1024 * 1024
+_LOG_BACKUPS = 5
+
+
+def _setup_logging() -> None:
+    """Log to the console *and* to a rotating file in the launch directory.
+
+    A run lasts days and nobody is watching the console; without a file there
+    is nothing to look at once something goes wrong.
+    """
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        handlers.append(RotatingFileHandler(
+            Path.cwd() / LOG_FILENAME, maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUPS, encoding="utf-8"))
+    except OSError as exc:  # pragma: no cover - filesystem dependent
+        print(f"cannot open {LOG_FILENAME}: {exc} — logging to console only")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers)
 
 
 def main() -> int:
     import sys
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _setup_logging()
     logger.info("python: %s", sys.executable)
+    logger.info("startup: %s", diag.format_stats(diag.process_stats()))
+    diag.keep_system_awake()
     root = tk.Tk()
     App(root, Settings())
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        diag.release_system_awake()
     return 0

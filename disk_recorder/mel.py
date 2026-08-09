@@ -107,13 +107,29 @@ def compute_mel(pcm: np.ndarray, sample_rate: int) -> np.ndarray:
     return mel
 
 
-def _draw_mel(ax, pcm: np.ndarray, sample_rate: int, fig, title: Optional[str],
-              show_xlabel: bool) -> None:
-    """Render one log-mel spectrogram onto an existing axis."""
-    mel = compute_mel(pcm, sample_rate)
+#: One capturing device's precomputed spectrogram: ``(label, (n_mels, T) array)``.
+Panel = tuple[str, np.ndarray]
+
+
+def compute_panels(items: list[tuple[str, np.ndarray]],
+                   sample_rate: int) -> list[Panel]:
+    """Compute one log-mel array per device from ``(label, pcm)`` pairs.
+
+    Only the *data* crosses the thread boundary — the pipeline never builds
+    matplotlib objects. Over a multi-day run that is tens of thousands of
+    Figures (each a web of reference cycles that only the generational GC can
+    collect) that are never created in the first place; the GUI redraws a
+    single long-lived Figure instead.
+    """
+    return [(label, compute_mel(pcm, sample_rate)) for label, pcm in items]
+
+
+def _draw_panel(ax, mel_data: np.ndarray, fig, title: Optional[str],
+                show_xlabel: bool) -> None:
+    """Render one precomputed log-mel spectrogram onto an existing axis."""
     hop_s = _MEL_CFG["hop_length_ms"] / 1000.0
-    duration = mel.shape[1] * hop_s
-    img = ax.imshow(mel, aspect="auto", origin="lower",
+    duration = mel_data.shape[1] * hop_s
+    img = ax.imshow(mel_data, aspect="auto", origin="lower",
                     extent=[0, duration, 0, _MEL_CFG["n_mels"]], interpolation="nearest")
     fig.colorbar(img, ax=ax, label="Log-mel (norm)")
     if show_xlabel:
@@ -123,32 +139,30 @@ def _draw_mel(ax, pcm: np.ndarray, sample_rate: int, fig, title: Optional[str],
         ax.set_title(title)
 
 
+def render_panels(fig, panels: list[Panel]) -> None:
+    """Draw ``panels`` as stacked subplots into an **existing**, reused Figure.
+
+    The figure is cleared first, so colorbars and axes from the previous file
+    are discarded rather than accumulating.
+    """
+    fig.clear()
+    n = max(1, len(panels))
+    fig.set_size_inches(7, 2.6 * n + 0.4, forward=False)
+    for i, (label, mel_data) in enumerate(panels):
+        ax = fig.add_subplot(n, 1, i + 1)
+        _draw_panel(ax, mel_data, fig, label, show_xlabel=(i == n - 1))
+    fig.tight_layout()
+
+
 def make_figure(pcm: np.ndarray, sample_rate: int, title: Optional[str] = None):
     """Build a matplotlib Figure of the log-mel spectrogram (no pyplot)."""
     from matplotlib.figure import Figure
 
     fig = Figure(figsize=(7, 3.2), dpi=100)
     ax = fig.add_subplot(111)
-    _draw_mel(ax, pcm, sample_rate, fig,
-              os.path.basename(title) if title else None, show_xlabel=True)
+    _draw_panel(ax, compute_mel(pcm, sample_rate), fig,
+                os.path.basename(title) if title else None, show_xlabel=True)
     fig.tight_layout()
     return fig
 
 
-def make_stacked_figure(items: list[tuple[str, np.ndarray]], sample_rate: int):
-    """Build one Figure stacking a log-mel spectrogram per input device.
-
-    ``items`` is a list of ``(label, pcm)`` pairs, one per capturing device; the
-    spectrograms are drawn in vertically stacked subplots (one above another),
-    sharing the time axis, so every device's capture of the same file is shown
-    together.
-    """
-    from matplotlib.figure import Figure
-
-    n = max(1, len(items))
-    fig = Figure(figsize=(7, 2.6 * n + 0.4), dpi=100)
-    for i, (label, pcm) in enumerate(items):
-        ax = fig.add_subplot(n, 1, i + 1)
-        _draw_mel(ax, pcm, sample_rate, fig, label, show_xlabel=(i == n - 1))
-    fig.tight_layout()
-    return fig

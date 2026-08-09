@@ -10,7 +10,12 @@ they can be created off the main thread and drawn by the GUI thread.
 from __future__ import annotations
 
 import threading
+from collections import deque
 from dataclasses import dataclass, field, replace
+
+#: How many recent per-file durations the rolling average is computed over.
+#: Bounded so a multi-day run does not accumulate an ever-growing list.
+_AVG_WINDOW = 200
 
 
 @dataclass(frozen=True)
@@ -49,9 +54,9 @@ class SessionState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._snap = Snapshot()
-        self._figure = None                 # matplotlib.figure.Figure | None
+        self._panels = None                 # list[mel.Panel] | None
         self._figure_token = 0
-        self._record_times: list[float] = []
+        self._record_times: deque[float] = deque(maxlen=_AVG_WINDOW)
         self._failed_files: list[str] = []
         self._channels: list[ChannelSnap] = []
 
@@ -60,9 +65,9 @@ class SessionState:
     def reset(self, total: int) -> None:
         with self._lock:
             self._snap = Snapshot(running=True, total=total, status="running")
-            self._figure = None
+            self._panels = None
             self._figure_token = 0
-            self._record_times = []
+            self._record_times.clear()
             self._failed_files = []
             self._channels = []
 
@@ -120,16 +125,24 @@ class SessionState:
         with self._lock:
             self._snap.errors += count
 
-    def record_success(self, record_seconds: float, saved_path: str, figure) -> None:
+    def record_success(self, record_seconds: float, saved_path: str,
+                       panels=None) -> None:
+        """Register a finished file; ``panels`` is optional.
+
+        Spectrogram panels are throttled by the pipeline (the GUI only ever
+        shows the most recent one), so ``None`` means "keep displaying the
+        previous spectrogram" rather than "clear it".
+        """
         with self._lock:
             self._record_times.append(record_seconds)
             self._snap.done += 1
             self._snap.avg_record_s = sum(self._record_times) / len(self._record_times)
             self._snap.last_saved = saved_path
             self._snap.capture_progress = 1.0
-            self._figure = figure
-            self._figure_token += 1
-            self._snap.figure_token = self._figure_token
+            if panels is not None:
+                self._panels = panels
+                self._figure_token += 1
+                self._snap.figure_token = self._figure_token
 
     def record_failure(self, failed_path: str) -> None:
         with self._lock:
@@ -144,9 +157,9 @@ class SessionState:
             # dataclasses are mutable; copy so the GUI never mutates live state.
             return Snapshot(**vars(self._snap))
 
-    def figure_for(self, token: int):
-        """Return (token, figure) if a newer figure than ``token`` exists."""
+    def panels_for(self, token: int):
+        """Return ``(token, panels)`` if spectrograms newer than ``token`` exist."""
         with self._lock:
-            if self._figure is not None and self._figure_token != token:
-                return self._figure_token, self._figure
+            if self._panels is not None and self._figure_token != token:
+                return self._figure_token, self._panels
             return token, None

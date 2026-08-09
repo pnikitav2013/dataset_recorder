@@ -95,6 +95,19 @@ class AudioSource:
         """Derive a mono :class:`Window` for ``channel`` from a raw capture."""
         raise NotImplementedError
 
+    def abort(self, force: bool = False) -> None:
+        """Make an in-flight capture give up, from another thread.
+
+        Called by the pipeline when a capture thread overruns its wall-clock
+        budget — a hung device must not deadlock the whole run. ``force`` is a
+        last resort for a reader that ignored the cooperative request.
+        """
+
+    def reopen(self) -> None:
+        """Close and re-open the device after an aborted or failed capture."""
+        self.close()
+        self.open()
+
     def close(self) -> None:  # pragma: no cover - trivial
         pass
 
@@ -235,12 +248,23 @@ class MicSource(AudioSource):
     combination is remembered so the probe runs only once.
     """
 
+    #: Wall-clock slack beyond the theoretical capture duration before a read is
+    #: considered wedged (suspended USB device, stalled driver).
+    _READ_GRACE_S = 5.0
+
     def __init__(self, device_index: Optional[int], sample_rate: int) -> None:
         self.sample_rate = sample_rate
         self._device = device_index
         self._capture_rate: Optional[int] = None
         self._capture_channels: Optional[int] = None
         self._stream = None   # kept open across all recordings in a session
+        # Serialises abort/close against each other so PortAudio never gets an
+        # abort on a stream that another thread is in the middle of closing.
+        self._io_lock = threading.Lock()
+        # Set by abort() and polled by the read loop. ``Pa_AbortStream`` alone
+        # is not enough: the loop reads in ~20 ms blocks, so an aborted stream
+        # just keeps returning and the capture would run to its full length.
+        self._abort_requested = threading.Event()
 
     def _candidate_rates(self) -> list[int]:
         import sounddevice as sd
@@ -334,6 +358,7 @@ class MicSource(AudioSource):
         if sync_cb is not None:
             sync_cb(SyncState.SYNCED)
         out_frames = target_samples + guard_samples
+        self._abort_requested.clear()
 
         # Lazily open on first call if open() was never called.
         if self._stream is None:
@@ -359,9 +384,23 @@ class MicSource(AudioSource):
         got = 0
         overflows = 0
         read_exc: Optional[Exception] = None
+        # Generous wall-clock cap so a suspended USB device or a stalled driver
+        # cannot block this thread — and, through the pipeline's join, the whole
+        # run — indefinitely. Mirrors the cap BoardSource already applies.
+        deadline = time.monotonic() + need / capture_rate + self._READ_GRACE_S
+        timed_out = False
+        aborted = False
         try:
             while got < need:
                 if stop_event is not None and stop_event.is_set():
+                    break
+                if self._abort_requested.is_set():
+                    aborted = True
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    logger.error("input device %s: capture timed out with %d/%d "
+                                 "frames — device stalled", self._device, got, need)
                     break
                 to_read = min(block, need - got)
                 data, overflowed = stream.read(to_read)
@@ -376,21 +415,28 @@ class MicSource(AudioSource):
                 if progress_cb is not None:
                     progress_cb(min(1.0, got / need))
         except Exception as exc:  # pragma: no cover - hardware dependent
-            # Stream died mid-read.  Mark it dead so the next call reopens.
+            # Stream died mid-read (or was aborted by the pipeline watchdog).
+            # Mark it dead so the next call reopens.
             read_exc = exc
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
-            self._stream = None
-            self._capture_rate = self._capture_channels = None
+            self.close()
         finally:
             if progress_cb is not None:
                 progress_cb(1.0)
 
         if read_exc is not None:
             raise read_exc
+        if aborted:
+            # The pipeline watchdog gave up on this capture; drop the stream so
+            # the next attempt starts from a freshly opened device.
+            self.close()
+            raise RuntimeError(f"capture on input device {self._device} aborted")
+        if timed_out:
+            # The stream is wedged, not merely slow: drop it so the next attempt
+            # starts from a freshly opened device.
+            self.close()
+            raise TimeoutError(
+                f"input device {self._device} delivered {got}/{need} frames "
+                f"before the capture deadline")
 
         warnings: list[str] = []
         if overflows:
@@ -423,11 +469,47 @@ class MicSource(AudioSource):
         return Window(pcm=pcm, errors=raw.errors, sync_lost=raw.sync_lost,
                       underrun=pcm.size < target_samples, warnings=raw.warnings)
 
-    def close(self) -> None:
-        if self._stream is not None:
+    def abort(self, force: bool = False) -> None:
+        """Make an in-flight capture give up, from another thread.
+
+        The cooperative flag is the mechanism that actually works: the read
+        loop polls it between ~20 ms blocks and unwinds in milliseconds.
+
+        ``Pa_AbortStream`` is deliberately **not** used for that, because it
+        makes things worse — it stops the stream while a ``read()`` is pending,
+        so the reader then waits forever for frames that will never arrive
+        (measured: cooperative flag unblocks in 9 ms; adding the PortAudio
+        abort wedged the reader indefinitely). It is only issued via ``force``,
+        for a reader that is genuinely blocked inside the driver and therefore
+        never reaches the flag check — at that point the stream is unusable
+        anyway and there is nothing left to lose.
+        """
+        self._abort_requested.set()
+        if not force:
+            logger.warning("asking capture on input device %s to stop", self._device)
+            return
+        with self._io_lock:
+            stream = self._stream
+            if stream is None:
+                return
+            logger.error("capture on input device %s ignored the stop request — "
+                         "forcing PortAudio to abort the stream", self._device)
             try:
-                self._stream.stop()
-                self._stream.close()
+                stream.abort()
             except Exception:  # pragma: no cover - hardware dependent
                 pass
-            self._stream = None
+
+    def reopen(self) -> None:
+        self._abort_requested.clear()
+        super().reopen()
+
+    def close(self) -> None:
+        with self._io_lock:
+            stream, self._stream = self._stream, None
+            self._capture_rate = self._capture_channels = None
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:  # pragma: no cover - hardware dependent
+                    pass
