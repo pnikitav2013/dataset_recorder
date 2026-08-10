@@ -167,7 +167,14 @@ class SlotPanel:
 
     def _select_input(self, name: str) -> None:
         idx = next((i for i, d in enumerate(self._input_devices)
-                    if d.name == name), 0 if self._input_devices else -1)
+                    if d.name == name), None)
+        if idx is None:
+            if name and self._input_devices:
+                logger.warning("slot %d: saved input device %r not found among %d "
+                               "enumerated devices — falling back to %s",
+                               self._index + 1, name, len(self._input_devices),
+                               self._input_devices[0].label)
+            idx = 0 if self._input_devices else -1
         if idx >= 0:
             self._input_combo.current(idx)
 
@@ -448,27 +455,45 @@ class App:
         self._input_devices = devices.list_input_devices()
         self._serial_ports = devices.list_serial_ports()
 
-        logger.info("devices: %d output, %d input, %d serial port(s)",
-                    len(self._output_devices), len(self._input_devices),
-                    len(self._serial_ports))
+        devices.log_enumeration(self._output_devices, self._input_devices)
+        logger.info("serial ports: %d", len(self._serial_ports))
 
+        # Populate every selector with the *complete* device list first. Working
+        # out which entry to preselect is a separate, best-effort step: if it
+        # ever fails it must not leave the operator with a truncated set of
+        # choices, which is far worse than a wrong default.
         self._output_combo["values"] = (
             [d.label for d in self._output_devices]
             or ["(no output devices — is sounddevice installed?)"])
-        if self._output_devices and self._output_combo.current() < 0:
-            self._output_combo.current(self._preferred_output_index())
-        elif not self._output_devices:
-            self._output_combo.current(0)
-
         for slot in self._slots:
             slot.set_devices(self._serial_ports, self._input_devices)
+
+        try:
+            if self._output_devices and self._output_combo.current() < 0:
+                self._output_combo.current(self._preferred_output_index())
+            elif not self._output_devices:
+                self._output_combo.current(0)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("could not preselect an output device")
+            if self._output_devices:
+                self._output_combo.current(0)
 
     def _select_output(self, name: str) -> None:
         idx = next((i for i, d in enumerate(self._output_devices) if d.name == name), None)
         if idx is not None:
             self._output_combo.current(idx)
-        elif self._output_devices:
-            self._output_combo.current(self._preferred_output_index())
+            return
+        if not self._output_devices:
+            return
+        # The saved speaker is gone (unplugged, renamed, or a different host
+        # API): say so instead of silently landing on some other device.
+        fallback = self._preferred_output_index()
+        if name:
+            logger.warning("saved output device %r not found among %d enumerated "
+                           "devices — preselecting %s instead", name,
+                           len(self._output_devices),
+                           self._output_devices[fallback].label)
+        self._output_combo.current(fallback)
 
     def _preferred_output_index(self) -> int:
         """Pick the most robust host API for the default output device.

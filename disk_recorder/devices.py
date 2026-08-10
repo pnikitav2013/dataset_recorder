@@ -139,6 +139,25 @@ def list_input_devices() -> list[AudioDeviceInfo]:
     return _audio_devices(want_output=False)
 
 
+def log_enumeration(outputs: list[AudioDeviceInfo],
+                    inputs: list[AudioDeviceInfo]) -> None:
+    """Log every device PortAudio reports, exactly as enumerated.
+
+    Nothing in this module ever *filters* the device lists — host-API ranking
+    only decides which entry is preselected. This dump is what answers "is my
+    device missing, or just not selected?" without guessing.
+    """
+    logger.info("audio devices: %d with outputs, %d with inputs",
+                len(outputs), len(inputs))
+    for kind, listing in (("output", outputs), ("input", inputs)):
+        for device in listing:
+            logger.info("  %-6s [%d] %s | %s | in=%d out=%d @ %.0f Hz%s",
+                        kind, device.index, device.name, device.host_api,
+                        device.max_input_channels, device.max_output_channels,
+                        device.default_samplerate,
+                        "  <- discouraged host API" if is_discouraged(device) else "")
+
+
 def host_api_rank(device: AudioDeviceInfo) -> int:
     """Rank a device by how well its host API survives a multi-day run.
 
