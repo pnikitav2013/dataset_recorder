@@ -144,10 +144,14 @@ def render_panels(fig, panels: list[Panel]) -> None:
 
     The figure is cleared first, so colorbars and axes from the previous file
     are discarded rather than accumulating.
+
+    The figure's *size* is deliberately left alone. When the figure is attached
+    to a Tk canvas, the widget owns the size; resizing the figure here makes
+    matplotlib render into a buffer of a different size than the widget's photo
+    image, which leaves torn fragments of earlier draws on screen.
     """
     fig.clear()
     n = max(1, len(panels))
-    fig.set_size_inches(7, 2.6 * n + 0.4, forward=False)
     for i, (label, mel_data) in enumerate(panels):
         ax = fig.add_subplot(n, 1, i + 1)
         _draw_panel(ax, mel_data, fig, label, show_xlabel=(i == n - 1))

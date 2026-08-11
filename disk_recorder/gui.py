@@ -81,6 +81,7 @@ class SlotPanel:
         self._input_devices: list[devices.AudioDeviceInfo] = []
         self._want_serial = ""      # desired (saved) serial device to reselect
         self._want_input = ""       # desired (saved) input device name to reselect
+        self._want_input_api = ""   # …and its host API, which disambiguates it
 
         frame = ttk.LabelFrame(parent, text=f"Input device {index + 1}")
         frame.pack(fill="x", padx=4, pady=4)
@@ -157,7 +158,7 @@ class SlotPanel:
         self._input_combo["values"] = (
             [f"{d.label} — {d.max_input_channels}ch" for d in input_devices] or [_NO_INPUT])
         self._select_serial(self._want_serial)
-        self._select_input(self._want_input)
+        self._select_input(self._want_input, self._want_input_api)
 
     def _select_serial(self, device_str: str) -> None:
         idx = next((i for i, p in enumerate(self._serial_ports)
@@ -165,16 +166,19 @@ class SlotPanel:
         if idx >= 0:
             self._port_combo.current(idx)
 
-    def _select_input(self, name: str) -> None:
-        idx = next((i for i, d in enumerate(self._input_devices)
-                    if d.name == name), None)
+    def _select_input(self, name: str, host_api: str = "") -> None:
+        idx = devices.find_index(self._input_devices, name, host_api)
         if idx is None:
             if name and self._input_devices:
-                logger.warning("slot %d: saved input device %r not found among %d "
-                               "enumerated devices — falling back to %s",
-                               self._index + 1, name, len(self._input_devices),
-                               self._input_devices[0].label)
+                logger.warning("slot %d: saved input device %r (%s) not found among "
+                               "%d enumerated devices — falling back to %s",
+                               self._index + 1, name, host_api or "any host API",
+                               len(self._input_devices), self._input_devices[0].label)
             idx = 0 if self._input_devices else -1
+        elif host_api and self._input_devices[idx].host_api != host_api:
+            logger.warning("slot %d: saved input device %r was on %s, which is gone — "
+                           "using the %s entry instead", self._index + 1, name,
+                           host_api, self._input_devices[idx].host_api)
         if idx >= 0:
             self._input_combo.current(idx)
 
@@ -197,24 +201,26 @@ class SlotPanel:
         self._channel_var.set(_CHANNEL_AUTO if cfg.channel < 0 else str(cfg.channel))
         self._want_serial = cfg.serial_port
         self._want_input = cfg.input_device
+        self._want_input_api = cfg.input_host_api
         self._select_serial(cfg.serial_port)
-        self._select_input(cfg.input_device)
+        self._select_input(cfg.input_device, cfg.input_host_api)
         self._update_enabled()
 
     def read_config(self) -> SlotConfig:
         port = ""
         if 0 <= self._port_combo.current() < len(self._serial_ports):
             port = self._serial_ports[self._port_combo.current()].device
-        input_name = ""
+        input_name = input_api = ""
         if 0 <= self._input_combo.current() < len(self._input_devices):
-            input_name = self._input_devices[self._input_combo.current()].name
+            device = self._input_devices[self._input_combo.current()]
+            input_name, input_api = device.name, device.host_api
         try:
             baud = int(self._baud_var.get())
         except ValueError:
             baud = self._settings.baud
         return SlotConfig(type=self._type(), prefix=self._prefix_var.get().strip(),
                           serial_port=port, baud=baud, input_device=input_name,
-                          channel=self._channel_value())
+                          input_host_api=input_api, channel=self._channel_value())
 
     # ----- spec building -----
 
@@ -394,7 +400,7 @@ class App:
 
     def _apply_config(self) -> None:
         self._folder_var.set(self._config.folder)
-        self._select_output(self._config.output_device)
+        self._select_output(self._config.output_device, self._config.output_host_api)
         self._routing_var.set(ROUTE_DISPLAY.get(self._config.output_routing,
                                                 ROUTE_DISPLAY["both"]))
         self._sched_enabled.set(self._config.schedule.enabled)
@@ -405,12 +411,14 @@ class App:
             slot.set_devices(self._serial_ports, self._input_devices)
 
     def _collect_config(self) -> AppConfig:
-        output_name = ""
+        output_name = output_api = ""
         if 0 <= self._output_combo.current() < len(self._output_devices):
-            output_name = self._output_devices[self._output_combo.current()].name
+            device = self._output_devices[self._output_combo.current()]
+            output_name, output_api = device.name, device.host_api
         return AppConfig(
             folder=self._folder_var.get().strip(),
             output_device=output_name,
+            output_host_api=output_api,
             output_routing=DISPLAY_ROUTE.get(self._routing_var.get(), "both"),
             window_width=self._root.winfo_width(),
             window_height=self._root.winfo_height(),
@@ -478,9 +486,13 @@ class App:
             if self._output_devices:
                 self._output_combo.current(0)
 
-    def _select_output(self, name: str) -> None:
-        idx = next((i for i, d in enumerate(self._output_devices) if d.name == name), None)
+    def _select_output(self, name: str, host_api: str = "") -> None:
+        idx = devices.find_index(self._output_devices, name, host_api)
         if idx is not None:
+            if host_api and self._output_devices[idx].host_api != host_api:
+                logger.warning("saved output device %r was on %s, which is gone — "
+                               "using the %s entry instead", name, host_api,
+                               self._output_devices[idx].host_api)
             self._output_combo.current(idx)
             return
         if not self._output_devices:
@@ -489,9 +501,9 @@ class App:
         # API): say so instead of silently landing on some other device.
         fallback = self._preferred_output_index()
         if name:
-            logger.warning("saved output device %r not found among %d enumerated "
+            logger.warning("saved output device %r (%s) not found among %d enumerated "
                            "devices — preselecting %s instead", name,
-                           len(self._output_devices),
+                           host_api or "any host API", len(self._output_devices),
                            self._output_devices[fallback].label)
         self._output_combo.current(fallback)
 
@@ -682,7 +694,9 @@ class App:
             self._canvas = FigureCanvasTkAgg(self._figure, master=self._canvas_frame)
             self._canvas.get_tk_widget().pack(fill="both", expand=True)
         mel.render_panels(self._figure, panels)
-        self._canvas.draw_idle()
+        # A full draw, not draw_idle(): the figure was just cleared and rebuilt,
+        # so the whole canvas must be repainted before the next update.
+        self._canvas.draw()
         self._fig_token = token
 
 

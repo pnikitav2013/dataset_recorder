@@ -21,6 +21,7 @@ import datetime
 import json
 import logging
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 logger = logging.getLogger("disk_recorder.appconfig")
@@ -98,10 +99,20 @@ class SlotConfig:
     serial_port: str = ""      # board: serial device string, e.g. "/dev/ttyACM0"
     baud: int = _DEFAULT_BAUD  # board: UART baud rate
     input_device: str = ""     # mic: audio input device name
+    # mic: host API of the chosen device ("Windows WASAPI", "MME", …). The same
+    # microphone is listed once per host API and they behave differently, so the
+    # name alone does not identify what the operator picked.
+    input_host_api: str = ""
     channel: int = -1          # mic: -1 = downmix all; >=0 = take that channel
 
     def enabled(self) -> bool:
         return self.type in (TYPE_BOARD, TYPE_MIC)
+
+    @classmethod
+    def from_raw(cls, raw: dict) -> "SlotConfig":
+        """Build from JSON, ignoring keys this version does not know about."""
+        fields = {f.name for f in dataclass_fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in fields})
 
 
 @dataclass
@@ -110,6 +121,7 @@ class AppConfig:
 
     folder: str = ""
     output_device: str = ""    # audio output device name
+    output_host_api: str = ""  # host API of that device (see SlotConfig)
     output_routing: str = ROUTE_BOTH   # mono playback routed to left/right/both
     window_width: int = 1680   # last main-window width in pixels
     window_height: int = 1440  # last main-window height in pixels
@@ -125,7 +137,7 @@ class AppConfig:
         if isinstance(self.schedule, dict):
             self.schedule = Schedule(**self.schedule)
         # Always keep exactly SLOT_COUNT slots, tolerating malformed JSON.
-        slots = [s if isinstance(s, SlotConfig) else SlotConfig(**s)
+        slots = [s if isinstance(s, SlotConfig) else SlotConfig.from_raw(s)
                  for s in self.slots]
         while len(slots) < SLOT_COUNT:
             slots.append(SlotConfig(prefix=f"mic{len(slots) + 1}"))
@@ -148,7 +160,7 @@ class AppConfig:
         except (OSError, ValueError) as exc:
             logger.warning("could not read config %s (%s) — using defaults", path, exc)
             return cls()
-        slots = [SlotConfig(**s) for s in raw.get("slots", [])]
+        slots = [SlotConfig.from_raw(s) for s in raw.get("slots", [])]
         routing = raw.get("output_routing", ROUTE_BOTH)
         if routing not in OUTPUT_ROUTES:
             routing = ROUTE_BOTH
@@ -163,6 +175,7 @@ class AppConfig:
         return cls(
             folder=raw.get("folder", ""),
             output_device=raw.get("output_device", ""),
+            output_host_api=raw.get("output_host_api", ""),
             output_routing=routing,
             window_width=_dim("window_width", 1680),
             window_height=_dim("window_height", 1440),

@@ -158,6 +158,32 @@ def log_enumeration(outputs: list[AudioDeviceInfo],
                         "  <- discouraged host API" if is_discouraged(device) else "")
 
 
+def find_index(devices: list[AudioDeviceInfo], name: str,
+               host_api: str = "") -> Optional[int]:
+    """Locate a saved device by name **and** host API.
+
+    PortAudio lists the same physical device once per host API, and those
+    entries behave very differently — "Speakers (Realtek)" exists as MME,
+    DirectSound, WASAPI and WDM-KS. Matching on the name alone therefore
+    silently resolves to whichever entry happens to come first, which is not
+    the one the operator picked.
+
+    An exact ``(name, host_api)`` match wins; a name-only match is accepted as
+    a fallback so configs written before the host API was recorded keep
+    working. Returns ``None`` when the device is not present at all.
+    """
+    if not name:
+        return None
+    if host_api:
+        for i, device in enumerate(devices):
+            if device.name == name and device.host_api == host_api:
+                return i
+    for i, device in enumerate(devices):
+        if device.name == name:
+            return i
+    return None
+
+
 def host_api_rank(device: AudioDeviceInfo) -> int:
     """Rank a device by how well its host API survives a multi-day run.
 
