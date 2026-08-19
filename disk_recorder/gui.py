@@ -7,9 +7,14 @@ the slot's re-recorded outputs (``<original>_R_<prefix>.wav``). The whole setup
 (folder, output device, the three slots) is persisted to a JSON file in the
 launch directory so it need not be re-entered after a restart.
 
-On *Start* the enabled slots become capture channels; the pipeline plays each
-file once and records every channel at the same time, saving only when all
-succeed. The window polls :class:`SessionState` to refresh progress, the
+A **Mode** selector chooses what *Start* does: re-record a folder (play every
+file once and capture every channel at the same time, saving only when all
+succeed — :class:`~disk_recorder.pipeline.Pipeline`) or record **noise** with no
+playback at all into a separate folder, cut into fixed-length chunks
+(:class:`~disk_recorder.noise.NoiseRecorder`). The fields the selected mode does
+not use are greyed out.
+
+The window polls :class:`SessionState` to refresh progress, the
 per-channel sync indicators and the stacked per-device spectrogram. Tk widgets
 are only ever touched from the main thread.
 """
@@ -23,9 +28,12 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import devices, diag, mel
-from .appconfig import (OUTPUT_ROUTES, SLOT_COUNT, SLOT_TYPES, TYPE_BOARD,
-                        TYPE_MIC, TYPE_OFF, AppConfig, Schedule, SlotConfig)
+from .appconfig import (MODE_NOISE, MODE_RERECORD, NOISE_CHUNK_MAX_MINUTES,
+                        NOISE_CHUNK_MIN_MINUTES, OUTPUT_ROUTES, SLOT_COUNT,
+                        SLOT_TYPES, TYPE_BOARD, TYPE_MIC, TYPE_OFF, AppConfig,
+                        Schedule, SlotConfig)
 from .config import Settings
+from .noise import NoiseRecorder
 from .pipeline import Channel, Pipeline
 from .playback import Player
 from .serial_link import SerialLink
@@ -42,6 +50,13 @@ TYPE_DISPLAY = {
     TYPE_MIC: "PC microphone",
 }
 DISPLAY_TYPE = {v: k for k, v in TYPE_DISPLAY.items()}
+
+# Run-mode variant <-> display label mapping.
+MODE_DISPLAY = {
+    MODE_RERECORD: "Re-record folder (play + capture)",
+    MODE_NOISE: "Noise only (no playback, chunked files)",
+}
+DISPLAY_MODE = {v: k for k, v in MODE_DISPLAY.items()}
 
 _NO_INPUT = "(no input devices)"
 _NO_PORT = "(no serial ports — is pyserial installed?)"
@@ -262,6 +277,7 @@ class App:
         self._settings = settings
         self._state = SessionState()
         self._pipeline = Pipeline(settings, self._state)
+        self._noise = NoiseRecorder(settings, self._state)
         self._config = AppConfig.load()
 
         self._output_devices: list[devices.AudioDeviceInfo] = []
@@ -304,30 +320,54 @@ class App:
         frame = ttk.LabelFrame(self._left, text="Setup")
         frame.pack(fill="both", expand=True)
 
+        # run mode: re-record a folder, or record noise only
+        ttk.Label(frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        self._mode_var = tk.StringVar(value=MODE_DISPLAY[MODE_RERECORD])
+        self._mode_combo = ttk.Combobox(
+            frame, state="readonly", width=40, textvariable=self._mode_var,
+            values=[MODE_DISPLAY[MODE_RERECORD], MODE_DISPLAY[MODE_NOISE]])
+        self._mode_combo.grid(row=0, column=1, sticky="w", padx=4)
+        self._mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._mode_changed())
+
         # folder
-        ttk.Label(frame, text="Folder:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
+        ttk.Label(frame, text="Folder:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
         self._folder_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self._folder_var, width=70).grid(
-            row=0, column=1, sticky="we", padx=4)
-        ttk.Button(frame, text="Browse…", command=self._browse).grid(row=0, column=2, padx=4)
+        self._folder_entry = ttk.Entry(frame, textvariable=self._folder_var, width=70)
+        self._folder_entry.grid(row=1, column=1, sticky="we", padx=4)
+        self._folder_btn = ttk.Button(frame, text="Browse…", command=self._browse)
+        self._folder_btn.grid(row=1, column=2, padx=4)
+
+        # noise mode: destination folder for the chunks + chunk length
+        ttk.Label(frame, text="Noise folder:").grid(row=2, column=0, sticky="w", padx=4, pady=3)
+        noise = ttk.Frame(frame)
+        noise.grid(row=2, column=1, columnspan=2, sticky="we", padx=0)
+        self._noise_folder_var = tk.StringVar()
+        self._noise_entry = ttk.Entry(noise, textvariable=self._noise_folder_var, width=48)
+        self._noise_entry.pack(side="left", padx=4)
+        self._noise_btn = ttk.Button(noise, text="Browse…", command=self._browse_noise)
+        self._noise_btn.pack(side="left", padx=4)
+        ttk.Label(noise, text="minutes per file:").pack(side="left", padx=(10, 2))
+        self._noise_chunk_var = tk.StringVar(value="5")
+        self._noise_chunk_entry = ttk.Entry(noise, textvariable=self._noise_chunk_var, width=6)
+        self._noise_chunk_entry.pack(side="left")
 
         # output device
-        ttk.Label(frame, text="Output device:").grid(row=1, column=0, sticky="w", padx=4, pady=3)
+        ttk.Label(frame, text="Output device:").grid(row=3, column=0, sticky="w", padx=4, pady=3)
         self._output_combo = ttk.Combobox(frame, state="readonly", width=68)
-        self._output_combo.grid(row=1, column=1, sticky="we", padx=4)
+        self._output_combo.grid(row=3, column=1, sticky="we", padx=4)
         frame.columnconfigure(1, weight=1)
 
         # output routing: mono playback to left / right / both speakers
-        ttk.Label(frame, text="Output routing:").grid(row=2, column=0, sticky="w", padx=4, pady=3)
+        ttk.Label(frame, text="Output routing:").grid(row=4, column=0, sticky="w", padx=4, pady=3)
         self._routing_var = tk.StringVar(value=ROUTE_DISPLAY["both"])
         self._routing_combo = ttk.Combobox(
             frame, state="readonly", width=20, textvariable=self._routing_var,
             values=[ROUTE_DISPLAY[r] for r in OUTPUT_ROUTES])
-        self._routing_combo.grid(row=2, column=1, sticky="w", padx=4)
+        self._routing_combo.grid(row=4, column=1, sticky="w", padx=4)
 
         # working-hours schedule: auto-pause overnight, resume in the morning
         sched = ttk.Frame(frame)
-        sched.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=3)
+        sched.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=3)
         self._sched_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(sched, text="Working hours — pause at",
                         variable=self._sched_enabled).pack(side="left")
@@ -340,18 +380,38 @@ class App:
 
         # input-device slots
         slots_frame = ttk.LabelFrame(frame, text="Input devices (recorded simultaneously)")
-        slots_frame.grid(row=4, column=0, columnspan=3, sticky="we", padx=4, pady=6)
+        slots_frame.grid(row=6, column=0, columnspan=3, sticky="we", padx=4, pady=6)
         for i in range(SLOT_COUNT):
             self._slots.append(SlotPanel(slots_frame, i, self._settings, self._on_slot_type_change))
 
         # buttons
         button_row = ttk.Frame(frame)
-        button_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=6)
+        button_row.grid(row=7, column=0, columnspan=3, sticky="w", padx=4, pady=6)
         ttk.Button(button_row, text="Refresh devices", command=self.refresh_devices).pack(side="left")
         self._start_btn = ttk.Button(button_row, text="Start", command=self._start)
         self._start_btn.pack(side="left", padx=6)
         self._stop_btn = ttk.Button(button_row, text="Stop", command=self._stop, state="disabled")
         self._stop_btn.pack(side="left")
+        self._mode_changed()
+
+    def _mode(self) -> str:
+        return DISPLAY_MODE.get(self._mode_var.get(), MODE_RERECORD)
+
+    def _mode_changed(self) -> None:
+        """Grey out the fields the selected mode does not use.
+
+        Noise recording plays nothing and scans nothing, so the source folder,
+        the output device and its routing are all irrelevant there; leaving them
+        live would only invite a run configured against fields that are ignored.
+        """
+        noise = self._mode() == MODE_NOISE
+        for widget in (self._noise_entry, self._noise_chunk_entry):
+            widget.configure(state="normal" if noise else "disabled")
+        self._noise_btn.configure(state="normal" if noise else "disabled")
+        self._folder_entry.configure(state="disabled" if noise else "normal")
+        self._folder_btn.configure(state="disabled" if noise else "normal")
+        self._output_combo.configure(state="disabled" if noise else "readonly")
+        self._routing_combo.configure(state="disabled" if noise else "readonly")
 
     def _build_status(self) -> None:
         frame = ttk.LabelFrame(self._right, text="Progress")
@@ -400,6 +460,10 @@ class App:
 
     def _apply_config(self) -> None:
         self._folder_var.set(self._config.folder)
+        self._mode_var.set(MODE_DISPLAY.get(self._config.mode, MODE_DISPLAY[MODE_RERECORD]))
+        self._noise_folder_var.set(self._config.noise_folder)
+        self._noise_chunk_var.set(f"{self._config.noise_chunk_min:g}")
+        self._mode_changed()
         self._select_output(self._config.output_device, self._config.output_host_api)
         self._routing_var.set(ROUTE_DISPLAY.get(self._config.output_routing,
                                                 ROUTE_DISPLAY["both"]))
@@ -417,6 +481,9 @@ class App:
             output_name, output_api = device.name, device.host_api
         return AppConfig(
             folder=self._folder_var.get().strip(),
+            mode=self._mode(),
+            noise_folder=self._noise_folder_var.get().strip(),
+            noise_chunk_min=self._chunk_minutes() or 5.0,
             output_device=output_name,
             output_host_api=output_api,
             output_routing=DISPLAY_ROUTE.get(self._routing_var.get(), "both"),
@@ -447,10 +514,12 @@ class App:
         # Give the pipeline a moment to close the serial ports and the audio
         # streams itself; killing the interpreter with streams still open is
         # exactly the kind of thing that leaves the audio stack in a bad state.
-        if self._pipeline.is_running():
+        if self._is_running():
             logger.info("window closing — stopping the run")
             self._pipeline.stop()
+            self._noise.stop()
             self._pipeline.join(timeout=10.0)
+            self._noise.join(timeout=10.0)
         self._root.destroy()
 
     def _on_slot_type_change(self) -> None:  # placeholder hook for live updates
@@ -521,14 +590,45 @@ class App:
         if folder:
             self._folder_var.set(folder)
 
+    def _browse_noise(self) -> None:
+        folder = filedialog.askdirectory(title="Choose folder for noise recordings")
+        if folder:
+            self._noise_folder_var.set(folder)
+
+    def _chunk_minutes(self) -> Optional[float]:
+        """Parsed chunk length, or ``None`` if the field is not a usable number."""
+        try:
+            minutes = float(self._noise_chunk_var.get().strip().replace(",", "."))
+        except ValueError:
+            return None
+        if not NOISE_CHUNK_MIN_MINUTES <= minutes <= NOISE_CHUNK_MAX_MINUTES:
+            return None
+        return minutes
+
+    def _is_running(self) -> bool:
+        return self._pipeline.is_running() or self._noise.is_running()
+
     # ----- run control -----
 
     def _start(self) -> None:
-        folder = self._folder_var.get().strip()
+        noise_mode = self._mode() == MODE_NOISE
+        folder = (self._noise_folder_var.get() if noise_mode
+                  else self._folder_var.get()).strip()
         if not folder:
-            messagebox.showwarning("disk_recorder", "Choose an audio folder first.")
+            messagebox.showwarning(
+                "disk_recorder",
+                "Choose a folder for the noise recordings first." if noise_mode
+                else "Choose an audio folder first.")
             return
-        if not self._output_devices or self._output_combo.current() < 0:
+        chunk_minutes = self._chunk_minutes()
+        if noise_mode and chunk_minutes is None:
+            messagebox.showwarning(
+                "disk_recorder",
+                f"Minutes per file must be a number between "
+                f"{NOISE_CHUNK_MIN_MINUTES:g} and {NOISE_CHUNK_MAX_MINUTES:g}.")
+            return
+        if not noise_mode and (not self._output_devices
+                               or self._output_combo.current() < 0):
             messagebox.showwarning("disk_recorder", "Choose an output device.")
             return
 
@@ -554,19 +654,26 @@ class App:
                 "disk_recorder",
                 "Working hours need two distinct HH:MM times (e.g. 08:00 and 22:00).")
             return
-        output = self._output_devices[self._output_combo.current()]
-        if not self._confirm_host_apis(output, specs):
-            return
-        channels = self._assemble_channels(specs)
 
-        self._save_config()
-        routing = DISPLAY_ROUTE.get(self._routing_var.get(), "both")
-        player = Player(output.index, routing)
-        self._pipeline.start(folder, channels, player, schedule)
+        if noise_mode:
+            # Nothing is played, so no output device is opened or validated.
+            if not self._confirm_host_apis(None, specs):
+                return
+            channels = self._assemble_channels(specs)
+            self._save_config()
+            self._noise.start(folder, channels, chunk_minutes, schedule)
+        else:
+            output = self._output_devices[self._output_combo.current()]
+            if not self._confirm_host_apis(output, specs):
+                return
+            channels = self._assemble_channels(specs)
+            self._save_config()
+            routing = DISPLAY_ROUTE.get(self._routing_var.get(), "both")
+            self._pipeline.start(folder, channels, Player(output.index, routing), schedule)
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
 
-    def _confirm_host_apis(self, output: devices.AudioDeviceInfo,
+    def _confirm_host_apis(self, output: Optional[devices.AudioDeviceInfo],
                            specs: list[_SlotSpec]) -> bool:
         """Warn before starting a long run on a fragile host API.
 
@@ -574,7 +681,7 @@ class App:
         unattended sessions; a run left on it for days is the configuration
         most likely to end with system audio needing a reboot.
         """
-        risky = [output.label] if devices.is_discouraged(output) else []
+        risky = [output.label] if output is not None and devices.is_discouraged(output) else []
         by_index = {d.index: d for d in self._input_devices}
         for spec in specs:
             device = by_index.get(spec.device_index) if spec.kind == TYPE_MIC else None
@@ -617,6 +724,7 @@ class App:
 
     def _stop(self) -> None:
         self._pipeline.stop()
+        self._noise.stop()
         self._status_var.set("stopping…")
 
     # ----- polling -----
@@ -631,17 +739,20 @@ class App:
             overall = (snap.done + capture) / snap.total * 100.0
             self._progress["value"] = min(100.0, overall)
         else:
-            self._progress["value"] = 0
+            # Noise mode has no known total (it runs until stopped): show how
+            # far the chunk currently being recorded has got instead.
+            self._progress["value"] = snap.capture_progress * 100.0 if snap.running else 0
         self._status_var.set(f"{snap.status}")
         self._update_indicator(self._rec_indicator, RecState, REC_COLORS, snap.rec_state)
         self._refresh_channel_indicators(snap.channels)
         self._labels["current_file"].set(snap.current_file or "-")
-        self._labels["progress"].set(f"{snap.done} / {snap.total}")
+        self._labels["progress"].set(f"{snap.done} / {snap.total}" if snap.total
+                                     else f"{snap.done} file(s)")
         self._labels["errors"].set(str(snap.errors))
         self._labels["failed"].set(str(snap.failed))
         self._labels["avg"].set(f"{snap.avg_record_s:.2f} s" if snap.avg_record_s else "-")
 
-        running = self._pipeline.is_running()
+        running = self._is_running()
         self._start_btn.configure(state="disabled" if running else "normal")
         self._stop_btn.configure(state="normal" if running else "disabled")
 

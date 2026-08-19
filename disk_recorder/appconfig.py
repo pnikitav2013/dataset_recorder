@@ -39,6 +39,12 @@ ROUTE_LEFT = "left"
 ROUTE_RIGHT = "right"
 OUTPUT_ROUTES = (ROUTE_BOTH, ROUTE_LEFT, ROUTE_RIGHT)
 
+# Run modes: re-record a folder of files, or just record the inputs (no
+# playback, no source folder) into fixed-length chunks.
+MODE_RERECORD = "rerecord"
+MODE_NOISE = "noise"
+RUN_MODES = (MODE_RERECORD, MODE_NOISE)
+
 # Slot variants.
 TYPE_OFF = "off"
 TYPE_BOARD = "board"
@@ -46,6 +52,22 @@ TYPE_MIC = "mic"
 SLOT_TYPES = (TYPE_OFF, TYPE_BOARD, TYPE_MIC)
 
 _DEFAULT_BAUD = 921600
+
+#: Bounds on the noise chunk length (minutes): long enough to be a real file,
+#: short enough that a crash never costs more than one chunk.
+NOISE_CHUNK_MIN_MINUTES = 0.1
+NOISE_CHUNK_MAX_MINUTES = 120.0
+
+
+def _chunk_minutes(value, default: float = 5.0) -> float:
+    """Coerce a persisted chunk length into the supported range."""
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return default
+    if minutes != minutes or minutes <= 0:   # NaN or non-positive
+        return default
+    return min(max(minutes, NOISE_CHUNK_MIN_MINUTES), NOISE_CHUNK_MAX_MINUTES)
 
 
 @dataclass
@@ -123,6 +145,9 @@ class AppConfig:
     output_device: str = ""    # audio output device name
     output_host_api: str = ""  # host API of that device (see SlotConfig)
     output_routing: str = ROUTE_BOTH   # mono playback routed to left/right/both
+    mode: str = MODE_RERECORD          # re-record a folder, or record noise only
+    noise_folder: str = ""             # where noise chunks are written
+    noise_chunk_min: float = 5.0       # length of one noise chunk, in minutes
     window_width: int = 1680   # last main-window width in pixels
     window_height: int = 1440  # last main-window height in pixels
     schedule: Schedule = field(default_factory=Schedule)   # working-hours window
@@ -177,6 +202,9 @@ class AppConfig:
             output_device=raw.get("output_device", ""),
             output_host_api=raw.get("output_host_api", ""),
             output_routing=routing,
+            mode=raw.get("mode") if raw.get("mode") in RUN_MODES else MODE_RERECORD,
+            noise_folder=raw.get("noise_folder", ""),
+            noise_chunk_min=_chunk_minutes(raw.get("noise_chunk_min", 5.0)),
             window_width=_dim("window_width", 1680),
             window_height=_dim("window_height", 1440),
             schedule=schedule,

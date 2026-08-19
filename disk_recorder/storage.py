@@ -44,6 +44,18 @@ def rerecord_path(source: Path, prefix: str, settings: Settings) -> Path:
     return source.with_name(f"{source.stem}{settings.rerecord_marker}{prefix}.wav")
 
 
+def noise_path(root: Path, prefix: str, stamp: str) -> Path:
+    """Destination for one noise chunk: ``<root>/<prefix>/<prefix>_<stamp>.wav``.
+
+    Each input device gets its own sub-folder so a multi-day session stays
+    browsable, and the parent directories are created on demand — the noise
+    folder is chosen in the GUI and usually does not exist yet.
+    """
+    folder = root / prefix
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{prefix}_{stamp}.wav"
+
+
 def save_wav(path: Path, pcm: np.ndarray, settings: Settings) -> None:
     """Write mono PCM16 to ``path`` (overwriting any prior output)."""
     pcm16 = np.asarray(pcm, dtype="<i2")

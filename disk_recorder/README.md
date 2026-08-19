@@ -22,6 +22,31 @@ attempt is discarded and the file is **replayed and re-recorded for all devices*
 Outputs are recognised by the `_R_` marker in their name and are never re-scanned
 as sources.
 
+### Noise mode (no playback)
+
+The **Mode** selector at the top of the window switches the whole run between
+two jobs:
+
+| Mode | What it does |
+|------|--------------|
+| `Re-record folder (play + capture)` | the default described above |
+| `Noise only (no playback, chunked files)` | records the enabled inputs continuously — nothing is played, no folder is scanned, nothing is aligned or deleted |
+
+In noise mode you pick a **separate destination folder** and the **length of one
+file** (5 minutes by default). Every enabled slot records the room at the same
+time and the stream is cut into fixed-length chunks:
+
+```
+<noise folder>/<prefix>/<prefix>_YYYYmmdd_HHMMSS.wav
+```
+
+Chunks are self-contained WAVs written back-to-back (a sub-second seam between
+files), so a crash or a power cut costs at most one chunk instead of a
+multi-day recording. *Stop* keeps the partial chunk recorded so far. The
+working-hours schedule applies here too, so an overnight pause does not fill the
+disk. The source folder, output device and routing are greyed out in this mode —
+nothing is played back.
+
 ### Input-device panel (three slots)
 
 The window has **three fixed input-device slots**. Each slot picks one of three
@@ -95,7 +120,7 @@ Worth doing once on the machine that runs the sessions:
 | Module        | Responsibility |
 |---------------|----------------|
 | `config`      | tunable `Settings` (baud, sample rate, headroom, retries, margins, `_R_` marker) |
-| `appconfig`   | JSON-persisted GUI config (folder, output device, three input-device slots) |
+| `appconfig`   | JSON-persisted GUI config (mode, folders, chunk length, output device, input-device slots) |
 | `devices`     | enumerate serial ports + audio devices, rank host APIs (WASAPI ≫ MME ≫ WDM-KS) |
 | `serial_link` | open the port + background reader thread |
 | `sources`     | `BoardSource` (STM32 UART) / `MicSource` (PC mic) capture, capture deadlines + cooperative abort |
@@ -104,6 +129,7 @@ Worth doing once on the machine that runs the sessions:
 | `sync`        | cross-correlation alignment + trim |
 | `mel`         | log-mel spectrogram `Figure`s, incl. stacked per-device (object API, thread-safe) |
 | `storage`     | recursive scan (excludes `*_R_*`), WAV write, original deletion |
+| `noise`       | continuous no-playback capture, cut into fixed-length chunks per device |
 | `pipeline`    | multi-device orchestration: play once → capture all → align → save all, all-or-retry |
 | `state`       | thread-safe session state (per-channel status) shared with the GUI |
 | `gui`         | the Tkinter window (three-slot input panel, persistence) |
